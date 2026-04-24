@@ -1,0 +1,25 @@
+{
+  "name": "aniwatch-coat-api",
+  "version": 2,
+  "builds": [
+    {
+      "src": "aniwatch_coat_scraper.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "aniwatch_coat_scraper.py"
+    }
+  ],
+  "functions": [
+    {
+      "src": "aniwatch_coat_scraper.py",
+      "runtime": "python3.11"
+    }
+  ],
+  "env": {
+    "PYTHON_VERSION": "3.11"
+  }
+}
