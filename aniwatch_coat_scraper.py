@@ -786,6 +786,9 @@ def create_app():
     @app.route('/extract')
     def extract():
         """Main extract endpoint"""
+        import re
+        import json as json_lib
+        
         slug = request.args.get('slug', '')
         episode = int(request.args.get('episode', 1))
         
@@ -832,6 +835,88 @@ def create_app():
         
         # Get m3u8 from first server
         stream = api.get_stream_url(servers[0]["url"])
+        master_m3u8 = stream.get("m3u8_url", "")
+        
+        # Extract all quality variants from master m3u8
+        qualities = []
+        if master_m3u8:
+            try:
+                # Try to get master m3u8 and parse qualities
+                master_resp = api.session.get(master_m3u8, timeout=10)
+                if master_resp.status_code == 200:
+                    master_content = master_resp.text
+                    # Find all quality variant m3u8s
+                    variant_matches = re.findall(r'(https?://[^\s"<>]+\.m3u8[^\s"<>]*)', master_content)
+                    # Also parse BANDWIDTH values
+                    bandwidth_matches = re.findall(r'#EXT-X-STREAM-INF:[^\n]+BANDWIDTH=(\d+)', master_content)
+                    
+                    for i, url in enumerate(variant_matches):
+                        height = 1080  # Default
+                        if i < len(bandwidth_matches):
+                            bw = int(bandwidth_matches[i])
+                            height = bw // 1000  # Approximate height
+                        
+                        # Try to extract height from URL
+                        height_match = re.search(r'(\d+)p', url)
+                        if height_match:
+                            height = int(height_match.group(1))
+                        
+                        qualities.append({
+                            "url": url,
+                            "height": height,
+                            "label": f"{height}p"
+                        })
+                    
+                    # If no variants found, use master
+                    if not qualities:
+                        qualities.append({
+                            "url": master_m3u8,
+                            "height": 1080,
+                            "label": "1080p"
+                        })
+            except:
+                if master_m3u8:
+                    qualities.append({
+                        "url": master_m3u8,
+                        "height": 1080,
+                        "label": "1080p"
+                    })
+        
+        # Fetch subtitles from stream page (1anime.site megaplay)
+        subtitle_tracks = []
+        try:
+            server_url = servers[0]["url"]
+            resp = api.session.get(server_url, timeout=10)
+            if resp.status_code == 200:
+                html = resp.text
+                # Look for tracks in JavaScript
+                track_match = re.search(r'tracks.*?(\[.*?"file".*?".*?\])', html)
+                if track_match:
+                    try:
+                        track_data = json_lib.loads(track_match.group(1))
+                        for track in track_data:
+                            if track.get("kind") == "captions":
+                                subtitle_tracks.append({
+                                    "url": track.get("file", ""),
+                                    "lang": track.get("label", "en").lower() if track.get("label") else "en",
+                                    "label": track.get("label", "English")
+                                })
+                    except:
+                        pass
+                
+                # Also try direct VTT matches
+                if not subtitle_tracks:
+                    vtt_matches = re.findall(r'"(https?://[^"<>]+\.vtt)"', html)
+                    for vtt_url in vtt_matches:
+                        lang_match = re.search(r'/([^/]+)\.vtt', vtt_url)
+                        lang = lang_match.group(1) if lang_match else "en"
+                        subtitle_tracks.append({
+                            "url": vtt_url,
+                            "lang": lang,
+                            "label": lang.capitalize()
+                        })
+        except:
+            pass
         
         return jsonify({
             "success": True,
@@ -846,7 +931,9 @@ def create_app():
             },
             "sources": servers,
             "m3u8_url": stream.get("m3u8_url"),
+            "qualities": qualities,
             "stream_success": stream.get("success"),
+            "tracks": subtitle_tracks,
             "fetch_headers": {
                 "User-Agent": "Mozilla/5.0",
                 "Referer": "https://aniwatch.co.at/"
