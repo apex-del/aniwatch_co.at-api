@@ -3,14 +3,14 @@
   "version": 2,
   "builds": [
     {
-      "src": "aniwatch_coat_scraper.py",
+      "src": "vercel.py",
       "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "aniwatch_coat_scraper.py"
+      "dest": "vercel.py"
     }
   ],
   "env": {
