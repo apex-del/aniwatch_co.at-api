@@ -7,9 +7,13 @@ Full working implementation based on code analysis.
 Flow:
 1. Search via WordPress REST API (wp-json/wp/v2/posts)
 2. Get anime info and episodes from anime page (scrape)
-3. Get episode servers via AJAX (hianime_episode_servers)
-4. Decode base64 hash to get stream URL
-5. Get m3u8 from stream page (requires curl_cffi for Cloudflare bypass)
+3. Get episode servers via REST API (wp-json/hianime/v1/episode/servers/{post_id})
+4. Decode base64 hash to get stream URL (1anime.site or my.1anime.site)
+5. Get m3u8 from megaplay.buzz getSources API (for megaplay sources)
+   - Fetch megaplay player page to extract cid
+   - Call /stream/getSources?id={cid} to get direct m3u8 + tracks
+   - No JS decryption needed - API returns plaintext m3u8 URL
+6. Direct MP4 for my.1anime.site sources
 """
 
 import re
@@ -195,132 +199,131 @@ class AniwatchAPI:
             return {"success": False, "error": str(e)}
     
     def get_episode_sources(self, episode_link: str) -> Dict[str, Any]:
-        """Get video sources for an episode"""
+        """Get video sources for an episode using WordPress REST API"""
         try:
-            # First get the episode page to extract episode_id
+            # First get the episode page to extract post_id
             resp = self.session.get(episode_link, timeout=30)
             if resp.status_code != 200:
                 return {"success": False, "error": f"Status {resp.status_code}"}
             
             html = resp.text
             
-            # Get the episode ID from data-id attribute
-            ep_id_match = re.search(r'data-id="(\d+)"', html)
-            if not ep_id_match:
-                return {"success": False, "error": "Episode ID not found"}
+            # Extract post_id from body class or REST API link
+            post_id_match = re.search(r'postid-(\d+)', html)
+            if not post_id_match:
+                post_id_match = re.search(r'wp-json/wp/v2/posts/(\d+)', html)
+            if not post_id_match:
+                return {"success": False, "error": "Post ID not found"}
             
-            episode_id = ep_id_match.group(1)
+            post_id = post_id_match.group(1)
             
-            # Get the episode nonce
-            ep_nonce_match = re.search(
-                r'hianime_ep_ajax\s*=\s*\{"ajax_url":"[^"]+","episode_nonce":"(\w+)"\}',
-                html
-            )
-            if not ep_nonce_match:
-                return {"success": False, "error": "Episode nonce not found"}
-            
-            episode_nonce = ep_nonce_match.group(1)
-            
-            # Call AJAX to get servers
-            ajax_resp = self.session.post(
-                AJAX_URL,
-                data={
-                    "action": "hianime_episode_servers",
-                    "episode_id": episode_id,
-                    "nonce": episode_nonce
-                },
+            # Call the new REST API endpoint for episode servers
+            api_resp = self.session.get(
+                f"{BASE_URL}/wp-json/hianime/v1/episode/servers/{post_id}",
                 timeout=30
             )
             
-            if ajax_resp.status_code != 200:
-                return {"success": False, "error": f"AJAX Status {ajax_resp.status_code}"}
+            if api_resp.status_code != 200:
+                return {"success": False, "error": f"API Status {api_resp.status_code}"}
             
-            result = ajax_resp.json()
+            try:
+                response_data = api_resp.json()
+            except:
+                return {"success": False, "error": "Failed to parse API response"}
             
-            if not result.get("status"):
-                return {"success": False, "error": result.get("html", "Failed")}
+            if not response_data.get("status"):
+                return {"success": False, "error": "API returned error status"}
             
-            # Parse server HTML
-            server_html = result.get("html", "")
+            html_content = response_data.get('html', '')
+            if not html_content:
+                return {"success": False, "error": "No HTML in response"}
             
-            # Extract servers
+            # Extract server name + hash pairs
             servers = []
-            server_items = re.findall(
-                r'data-server-name="([^"]+)"[^>]+data-hash="([^"]+)"',
-                server_html
-            )
-            
-            for server_name, server_hash in server_items:
+            for match in re.finditer(r'data-server-name="([^"]+)"[^>]+data-hash="([^"]+)"', html_content):
+                name = match.group(1)
+                h = match.group(2)
                 try:
-                    stream_url = base64.b64decode(server_hash).decode("utf-8")
+                    decoded = base64.b64decode(h).decode('utf-8')
                     servers.append({
-                        "name": server_name,
-                        "url": stream_url,
-                        "type": "sub" if "sub" in server_hash else "dub"
+                        "name": name,
+                        "hash": h,
+                        "url": decoded,
+                        "type": "sub" if "/sub" in decoded else "dub"
                     })
-                except Exception:
+                except:
                     continue
             
-            return {
-                "success": True,
-                "episode_id": episode_id,
-                "servers": servers
-            }
+            # Fallback: just extract hashes if name+hash pattern fails
+            if not servers:
+                for h in re.findall(r'data-hash="([^"]+)"', html_content):
+                    try:
+                        decoded = base64.b64decode(h).decode('utf-8')
+                        servers.append({
+                            "name": "VidSrc",
+                            "hash": h,
+                            "url": decoded,
+                            "type": "sub" if "/sub" in decoded else "dub"
+                        })
+                    except:
+                        continue
             
+            if not servers:
+                return {"success": False, "error": "No servers found"}
+            
+            return {"success": True, "post_id": post_id, "servers": servers}
         except Exception as e:
             return {"success": False, "error": str(e)}
     
-    def get_episode_sources_by_id(self, episode_id: str, nonce: str) -> Dict[str, Any]:
-        """Get servers by episode_id and nonce directly"""
+    def get_episode_sources_by_id(self, post_id: str, nonce: str = None) -> Dict[str, Any]:
+        """Get servers by post_id directly via REST API"""
         try:
-            ajax_resp = self.session.post(
-                AJAX_URL,
-                data={
-                    "action": "hianime_episode_servers",
-                    "episode_id": episode_id,
-                    "nonce": nonce
-                },
+            api_resp = self.session.get(
+                f"{BASE_URL}/wp-json/hianime/v1/episode/servers/{post_id}",
                 timeout=30
             )
             
-            if ajax_resp.status_code != 200:
-                return {"success": False, "error": f"AJAX Status {ajax_resp.status_code}"}
+            if api_resp.status_code != 200:
+                return {"success": False, "error": f"API Status {api_resp.status_code}"}
             
-            result = ajax_resp.json()
+            response_data = api_resp.json()
+            if not response_data.get("status"):
+                return {"success": False, "error": "API returned error status"}
             
-            if not result.get("status"):
-                return {"success": False, "error": result.get("html", "Failed")}
-            
-            server_html = result.get("html", "")
-            
+            html_content = response_data.get("html", "")
             servers = []
-            server_items = re.findall(
-                r'data-server-name="([^"]+)"[^>]+data-hash="([^"]+)"',
-                server_html
-            )
             
-            for server_name, server_hash in server_items:
+            for match in re.finditer(r'data-server-name="([^"]+)"[^>]+data-hash="([^"]+)"', html_content):
+                name = match.group(1)
+                h = match.group(2)
                 try:
-                    stream_url = base64.b64decode(server_hash).decode("utf-8")
+                    stream_url = base64.b64decode(h).decode("utf-8")
                     servers.append({
-                        "name": server_name,
+                        "name": name,
                         "url": stream_url,
-                        "type": "sub" if "sub" in server_hash else "dub"
+                        "type": "sub" if "/sub" in stream_url else "dub"
                     })
-                except Exception:
+                except:
                     continue
+            
+            if not servers:
+                for h in re.findall(r'data-hash="([^"]+)"', html_content):
+                    try:
+                        stream_url = base64.b64decode(h).decode("utf-8")
+                        servers.append({"name": "VidSrc", "url": stream_url, "type": "sub" if "/sub" in stream_url else "dub"})
+                    except:
+                        continue
             
             return {
                 "success": True,
-                "episode_id": episode_id,
+                "post_id": post_id,
                 "servers": servers
             }
-            
         except Exception as e:
             return {"success": False, "error": str(e)}
     
     def get_stream_url(self, stream_url: str) -> Dict[str, Any]:
-        """Get m3u8 URL from stream page"""
+        """Get m3u8 URL from stream page using megaplay.buzz getSources API"""
         try:
             resp = self.session.get(
                 stream_url,
@@ -329,24 +332,97 @@ class AniwatchAPI:
                 allow_redirects=True
             )
             
-            # Check 403
             if resp.status_code == 403:
                 return {"success": False, "error": "403 blocked", "needs_browser": True}
             
             html = resp.text
             
-            # Try to find m3u8 first
+            # Direct m3u8 in page
             m3u8_match = re.search(r'(https?://[^\s"<>]+\.m3u8[^\s"<>]*)', html)
             if m3u8_match:
                 return {"success": True, "m3u8_url": m3u8_match.group(1)}
             
-            # Check for Cloudflare challenge if no m3u8 found
+            # my.1anime.site: direct video player with <source src="videos/...">
+            video_match = re.search(r'<source\s+src="([^"]+)"', html)
+            if video_match and "my.1anime.site" in stream_url:
+                base = "https://my.1anime.site/"
+                video_url = urljoin(base, video_match.group(1))
+                return {"success": True, "m3u8_url": video_url, "type": "mp4"}
+            
+            # megaplay.buzz iframe path
+            iframe_match = re.search(r'<iframe[^>]+src="([^"]+)"', html)
+            if iframe_match:
+                iframe_url = iframe_match.group(1)
+                
+                # Fetch megaplay player page to extract cid
+                mega_resp = self.session.get(
+                    iframe_url,
+                    headers={"Referer": "https://1anime.site/"},
+                    timeout=30
+                )
+                
+                if mega_resp.status_code != 200:
+                    return {"success": False, "error": f"megaplay status {mega_resp.status_code}"}
+                
+                cid_match = re.search(r'cid\s*:\s*["\x27]([^"\x27]+)["\x27]', mega_resp.text)
+                if not cid_match:
+                    return {
+                        "success": True,
+                        "m3u8_url": iframe_url,
+                        "iframe_url": iframe_url,
+                        "note": "cid not found - fallback to iframe"
+                    }
+                
+                cid = cid_match.group(1)
+                
+                # Call getSources API
+                sources_resp = self.session.get(
+                    f"https://megaplay.buzz/stream/getSources?id={cid}",
+                    headers={
+                        "Referer": iframe_url,
+                        "X-Requested-With": "XMLHttpRequest",
+                    },
+                    timeout=30
+                )
+                
+                if sources_resp.status_code != 200:
+                    return {"success": False, "error": f"getSources status {sources_resp.status_code}"}
+                
+                try:
+                    sources_data = sources_resp.json()
+                except:
+                    return {"success": False, "error": "getSources invalid JSON"}
+                
+                m3u8 = sources_data.get("sources", {}).get("file", "")
+                if not m3u8:
+                    return {"success": False, "error": "No m3u8 in getSources response"}
+                
+                # Extract subtitle tracks
+                tracks = []
+                for t in sources_data.get("tracks", []):
+                    if t.get("kind") == "captions" or t.get("kind") == "subtitles":
+                        tracks.append({
+                            "url": t.get("file", ""),
+                            "lang": t.get("label", "en").lower() if t.get("label") else "en",
+                            "label": t.get("label", "English"),
+                        })
+                
+                return {
+                    "success": True,
+                    "m3u8_url": m3u8,
+                    "cid": cid,
+                    "iframe_url": iframe_url,
+                    "tracks": tracks,
+                    "type": "hls",
+                }
+            
+            # Cloudflare challenge check
             if "cf-" in resp.text.lower() or "challenge" in resp.text.lower():
                 return {"success": False, "error": "Cloudflare challenge", "needs_browser": True}
             
-            return {"success": False, "error": "No m3u8", "has_content": len(html) > 100}
-        except Exception:
-            return {"success": False, "error": "No m3u8"}
+            return {"success": False, "error": "No m3u8 or iframe found", "has_content": len(html) > 100}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
     
     def get_home(self) -> Dict[str, Any]:
         """Get homepage data - recent anime"""
@@ -833,30 +909,34 @@ def create_app():
         if not servers:
             return jsonify({"success": False, "error": "No servers"}), 404
         
-        # Get m3u8 from first server
+        # Get m3u8 from first server (includes tracks from getSources API)
         stream = api.get_stream_url(servers[0]["url"])
         master_m3u8 = stream.get("m3u8_url", "")
+        subtitle_tracks = stream.get("tracks", [])
         
         # Extract all quality variants from master m3u8
         qualities = []
-        if master_m3u8:
+        if master_m3u8 and not master_m3u8.endswith(".mp4"):
             try:
                 # Try to get master m3u8 and parse qualities
-                master_resp = api.session.get(master_m3u8, timeout=10)
+                master_resp = api.session.get(master_m3u8, timeout=10, headers={"Referer": "https://megaplay.buzz/"})
                 if master_resp.status_code == 200:
                     master_content = master_resp.text
                     # Find all quality variant m3u8s
                     variant_matches = re.findall(r'(https?://[^\s"<>]+\.m3u8[^\s"<>]*)', master_content)
                     # Also parse BANDWIDTH values
                     bandwidth_matches = re.findall(r'#EXT-X-STREAM-INF:[^\n]+BANDWIDTH=(\d+)', master_content)
+                    # Parse RESOLUTION for accurate heights
+                    resolution_matches = re.findall(r'RESOLUTION=(\d+)x(\d+)', master_content)
                     
                     for i, url in enumerate(variant_matches):
-                        height = 1080  # Default
-                        if i < len(bandwidth_matches):
+                        height = 1080
+                        if i < len(resolution_matches):
+                            height = int(resolution_matches[i][1])
+                        elif i < len(bandwidth_matches):
                             bw = int(bandwidth_matches[i])
-                            height = bw // 1000  # Approximate height
+                            height = bw // 1000
                         
-                        # Try to extract height from URL
                         height_match = re.search(r'(\d+)p', url)
                         if height_match:
                             height = int(height_match.group(1))
@@ -867,56 +947,13 @@ def create_app():
                             "label": f"{height}p"
                         })
                     
-                    # If no variants found, use master
                     if not qualities:
-                        qualities.append({
-                            "url": master_m3u8,
-                            "height": 1080,
-                            "label": "1080p"
-                        })
+                        qualities.append({"url": master_m3u8, "height": 1080, "label": "1080p"})
             except:
                 if master_m3u8:
-                    qualities.append({
-                        "url": master_m3u8,
-                        "height": 1080,
-                        "label": "1080p"
-                    })
-        
-        # Fetch subtitles from stream page (1anime.site megaplay)
-        subtitle_tracks = []
-        try:
-            server_url = servers[0]["url"]
-            resp = api.session.get(server_url, timeout=10)
-            if resp.status_code == 200:
-                html = resp.text
-                # Look for tracks in JavaScript
-                track_match = re.search(r'tracks.*?(\[.*?"file".*?".*?\])', html)
-                if track_match:
-                    try:
-                        track_data = json_lib.loads(track_match.group(1))
-                        for track in track_data:
-                            if track.get("kind") == "captions":
-                                subtitle_tracks.append({
-                                    "url": track.get("file", ""),
-                                    "lang": track.get("label", "en").lower() if track.get("label") else "en",
-                                    "label": track.get("label", "English")
-                                })
-                    except:
-                        pass
-                
-                # Also try direct VTT matches
-                if not subtitle_tracks:
-                    vtt_matches = re.findall(r'"(https?://[^"<>]+\.vtt)"', html)
-                    for vtt_url in vtt_matches:
-                        lang_match = re.search(r'/([^/]+)\.vtt', vtt_url)
-                        lang = lang_match.group(1) if lang_match else "en"
-                        subtitle_tracks.append({
-                            "url": vtt_url,
-                            "lang": lang,
-                            "label": lang.capitalize()
-                        })
-        except:
-            pass
+                    qualities.append({"url": master_m3u8, "height": 1080, "label": "1080p"})
+        elif master_m3u8:
+            qualities.append({"url": master_m3u8, "height": 1080, "label": "1080p", "type": "mp4"})
         
         return jsonify({
             "success": True,
@@ -934,9 +971,10 @@ def create_app():
             "qualities": qualities,
             "stream_success": stream.get("success"),
             "tracks": subtitle_tracks,
+            "stream_type": stream.get("type", "hls"),
             "fetch_headers": {
                 "User-Agent": "Mozilla/5.0",
-                "Referer": "https://aniwatch.co.at/"
+                "Referer": "https://megaplay.buzz/"
             }
         })
     
@@ -1125,10 +1163,12 @@ def extract_anime(slug: str, episode: int = 1):
         },
         "sources": servers,
         "m3u8_url": stream.get("m3u8_url"),
+        "tracks": stream.get("tracks", []),
         "stream_success": stream.get("success"),
+        "stream_type": stream.get("type", "hls"),
         "fetch_headers": {
             "User-Agent": "Mozilla/5.0",
-            "Referer": "https://aniwatch.co.at/"
+            "Referer": "https://megaplay.buzz/"
         }
     }
 
